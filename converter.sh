@@ -612,6 +612,63 @@ status_message process "Compiling final model list"
 # get our final 3d model list from the config
 model_list=( $(jq -r '.[] | select(.generated == false) | .path' config.json) )
 
+# generate icons for 3D items based on their GUI display settings
+status_message process "Generating GUI icons for 3D items"
+mkdir -p ./target/rp/textures/minecraft/item/gui_icons
+echo '{}' > scratch_files/3d_icon_map.json
+
+jq -r '.[] | select(.generated == false) | [.path, .geyserID, .item, .path_hash] | @tsv | gsub("\\t";",")' config.json > scratch_files/3d_icon_sources.csv
+
+while IFS=, read -r model_path gid item path_hash
+do
+  generate_gui_icon () {
+    local model_path=${1}
+    local item=${2}
+    local path_hash=${3}
+
+    local icon_source="$(jq -r 'def namespace: if contains(":") then sub("\\:(.+)"; "") else "minecraft" end; (.textures.default // .textures.layer0 // ([.textures[]][0]?)) as $tex | if $tex then "./assets/" + ($tex | namespace) + "/textures/" + ($tex | sub("(.*?)\\:"; "")) + ".png" else "null" end' ${model_path})"
+
+    if [[ ${icon_source} = null ]] || [[ ! -f ${icon_source} ]]
+    then
+      return
+    fi
+
+    local gui_scale="$(jq -r '(.display.gui.scale // null) | if . == null then "" else (.[0] | tostring) + "," + (.[1] | tostring) + "," + (.[2] | tostring) end' ${model_path})"
+    local resize=32
+    if [[ -n "${gui_scale}" ]]; then
+      resize=$(python - <<PY
+import math
+scale=list(map(float,"${gui_scale}".split(",")))
+factor=max(abs(s) for s in scale)
+print(int(max(16, min(64, round(16*factor)))))
+PY
+)
+    fi
+
+    local icon_key="$(echo ${item} | sed 's/minecraft://g' | tr ':' '_' )_${path_hash}"
+    local target_path="./target/rp/textures/minecraft/item/gui_icons/${icon_key}.png"
+
+    convert "${icon_source}" -resize ${resize}x${resize} -background none -gravity center -extent 32x32 "${target_path}" 2> /dev/null || return
+
+    echo "${path_hash},${icon_key},textures/minecraft/item/gui_icons/${icon_key}" >> scratch_files/3d_icons.csv
+  }
+  wait_for_jobs
+  generate_gui_icon "${model_path}" "${item}" "${path_hash}" &
+done < scratch_files/3d_icon_sources.csv
+wait # wait for icon generation jobs
+
+if [[ -f scratch_files/3d_icons.csv ]]
+then
+  jq -cR 'split(",")' scratch_files/3d_icons.csv | jq -s 'map({(.[1]): {"textures": .[2]}}) | add' > scratch_files/3d_icons.json
+  jq -s '
+  .[0] as $icons
+  | .[1]
+  | .texture_data += $icons
+  ' scratch_files/3d_icons.json ./target/rp/textures/item_texture.json | sponge ./target/rp/textures/item_texture.json
+
+  jq -cR 'split(",")' scratch_files/3d_icons.csv | jq -s 'map({(.[0]): .[1]}) | add' > scratch_files/3d_icon_map.json
+fi
+
 # get our final texture list to be atlased
 # get a bash array of all texture files in our resource pack
 status_message process "Generating an array of all model PNG files to crosscheck with our atlas"
@@ -1111,24 +1168,25 @@ fi
 
 status_message process "Creating Geyser mappings in target directory"
 echo
-jq '
+jq --slurpfile icon_map scratch_files/3d_icon_map.json '
 ([map(
   {
     ("minecraft:" + .item): [
-      {
+      ({
+        "type": (if .nbt.CustomModelData then "legacy" else "durability" end),
         "name": .path_hash,
-        "allow_offhand": true,
-        "icon": (if .generated == true then .path_hash else .bedrock_icon.icon end)
+        "bedrock_identifier": ("geyser_custom:" + .path_hash)
       }
-      + (if (.generated == false) then {"frame": (.bedrock_icon.frame)} else {} end)
       + (if .nbt.CustomModelData then {"custom_model_data": (.nbt.CustomModelData)} else {} end)
-      + (if .nbt.Damage then {"damage_predicate": (.nbt.Damage)} else {} end)
-      + (if .nbt.Unbreakable then {"unbreakable": (.nbt.Unbreakable)} else {} end)
+      + (if (.nbt.CustomModelData | not) and .nbt.Damage then {"damage_predicate": (.nbt.Damage)} else {} end)
+      + (if (.nbt.CustomModelData | not) and .nbt.Unbreakable then {"unbreakable": (.nbt.Unbreakable)} else {} end)
+      + (((($icon_map[0][(.path_hash)] // null) // (if .generated == true then .path_hash else .bedrock_icon.icon end))) as $icon
+        | if $icon != null then {"bedrock_options": {"icon": $icon}} else {} end))
     ]
   }
-) 
+)
 | map(to_entries[])
-| group_by(.key)[] 
+| group_by(.key)[]
 | {(.[0].key) : map(.value) | add}] | add) as $mappings
 | {
     "format_version": "1",
@@ -1168,13 +1226,19 @@ if [ -f sprites.json ]; then
   jq -s '
   {
   "format_version": "1",
-  "items": 
+  "items":
     ((.[0] | keys | map({(.): (.)}) | add) as $sprites | .[1].items | to_entries | map(
     (.key | split(":")[1]) as $item
     | .value | {("minecraft:" + $item): (map(
       .name as $name
-      | .icon as $icon
-      | .icon = ($sprites[($name)] // $icon)
+      | .bedrock_options as $options
+      | .bedrock_options = (
+          if ($sprites[($name)] // null) != null then
+            ($options // {} + {"icon": $sprites[($name)]})
+          else
+            $options
+          end
+        )
     ))}
     ) | add)
   }
