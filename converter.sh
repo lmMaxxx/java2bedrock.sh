@@ -1115,20 +1115,21 @@ jq '
 ([map(
   {
     ("minecraft:" + .item): [
-      {
+      ({
+        "type": (if .nbt.CustomModelData then "legacy" else "durability" end),
         "name": .path_hash,
-        "allow_offhand": true,
-        "icon": (if .generated == true then .path_hash else .bedrock_icon.icon end)
+        "bedrock_identifier": ("geyser_custom:" + .path_hash)
       }
-      + (if (.generated == false) then {"frame": (.bedrock_icon.frame)} else {} end)
       + (if .nbt.CustomModelData then {"custom_model_data": (.nbt.CustomModelData)} else {} end)
-      + (if .nbt.Damage then {"damage_predicate": (.nbt.Damage)} else {} end)
-      + (if .nbt.Unbreakable then {"unbreakable": (.nbt.Unbreakable)} else {} end)
+      + (if (.nbt.CustomModelData | not) and .nbt.Damage then {"damage_predicate": (.nbt.Damage)} else {} end)
+      + (if (.nbt.CustomModelData | not) and .nbt.Unbreakable then {"unbreakable": (.nbt.Unbreakable)} else {} end)
+      + (((if .generated == true then .path_hash else .bedrock_icon.icon end)) as $icon
+        | if $icon != null then {"bedrock_options": {"icon": $icon}} else {} end))
     ]
   }
-) 
+)
 | map(to_entries[])
-| group_by(.key)[] 
+| group_by(.key)[]
 | {(.[0].key) : map(.value) | add}] | add) as $mappings
 | {
     "format_version": "1",
@@ -1168,13 +1169,19 @@ if [ -f sprites.json ]; then
   jq -s '
   {
   "format_version": "1",
-  "items": 
+  "items":
     ((.[0] | keys | map({(.): (.)}) | add) as $sprites | .[1].items | to_entries | map(
     (.key | split(":")[1]) as $item
     | .value | {("minecraft:" + $item): (map(
       .name as $name
-      | .icon as $icon
-      | .icon = ($sprites[($name)] // $icon)
+      | .bedrock_options as $options
+      | .bedrock_options = (
+          if ($sprites[($name)] // null) != null then
+            ($options // {} + {"icon": $sprites[($name)]})
+          else
+            $options
+          end
+        )
     ))}
     ) | add)
   }
